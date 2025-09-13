@@ -1,0 +1,748 @@
+use std::{
+    io::{Read, Seek, SeekFrom, Write},
+    usize,
+};
+
+
+/// Struct that adds buffering to any `T` that supports `Read`, `Write` and `Seek`
+pub struct BufReaderWriter<T: Write + Seek> {
+    source: T,
+    pos: u64,
+    n: usize,
+    buffer: Buffer,
+}
+
+
+impl<T> BufReaderWriter<T>
+where
+    T: Write + Seek,
+{
+    /// Creates a new BufWriter from the input
+    pub fn new(source: T) -> Self {
+        Self {
+            source,
+            pos: 0,
+            n: 0,
+            buffer: Buffer::new(),
+        }
+    }
+
+    /// Returns the position in the data
+    pub fn position(&self) -> u64 {
+        self.position_in_source() + self.buffer.position() as u64
+    }
+
+    /// Returns the number of bytes the internal buffer can hold at once.
+    pub fn capacity(&self) -> usize {
+        self.buffer.capacity()
+    }
+
+    /// Returns the current position in the source
+    // todo: this name is not really accurate
+    fn position_in_source(&self) -> u64 {
+        self.pos - self.n as u64
+    }
+
+    pub fn inner(&self) -> &T {
+        &self.source
+    }
+
+    fn dump_buffer(&mut self) -> std::io::Result<()> {
+        if self.n != 0 {
+            let p = self.source.seek(SeekFrom::Current(-(self.n as i64)))?;
+            debug_assert_eq!(self.pos - self.n as u64, p);
+            self.pos = p;
+        }
+        let n = self.buffer.dump(&mut self.source)?;
+
+        // This would mean we wrote fewer bytes than what we originally read
+        debug_assert!(n >= self.n);
+
+        self.pos += n as u64;
+        if self.n != 0 {
+            self.n = n;
+        }
+        Ok(())
+    }
+
+}
+
+impl<T> Read for BufReaderWriter<T>
+where
+    T: Read + Write + Seek,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.buffer.get_read_command(buf) {
+            ReadCommand::Read(n) => self.buffer.read(&mut buf[..n]),
+            ReadCommand::FillRead { dump_before_fill } => {
+                if dump_before_fill {
+                    self.dump_buffer()?;
+                    self.buffer.clear();
+                    self.n = 0;
+                }
+                let n = self.buffer.fill_from(&mut self.source)?;
+                self.pos += n as u64;
+                self.n = n;
+                self.buffer.read(buf)
+            }
+            ReadCommand::ReadDirect { dump_before } => {
+                if dump_before {
+                    self.dump_buffer()?;
+                    self.buffer.clear();
+                    self.n = 0;
+                }
+                let n = self.source.read(buf)?;
+                self.pos += n as u64;
+                Ok(n)
+            }
+        }
+    }
+}
+
+impl<T> Write for BufReaderWriter<T>
+where
+    T: Write + Seek,
+{
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.buffer.get_write_exact_command(buf) {
+            WriteAllCommand::Write => self.buffer.write(buf),
+            WriteAllCommand::WriteDumpWrite(n) => {
+                let (first, second) = buf.split_at(n);
+                self.buffer.write(first)?;
+                self.dump_buffer()?;
+                self.buffer.clear();
+                self.n = 0;
+                self.buffer.write(second)?;
+                Ok(buf.len())
+            }
+            WriteAllCommand::DumpWriteDirect => {
+                self.dump_buffer()?;
+                self.buffer.clear();
+                self.n = 0;
+                self.source.write(buf)
+            }
+            WriteAllCommand::WriteDirect => self.source.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.dump_buffer()?;
+        self.buffer.clear();
+        self.n = 0;
+        self.source.flush()
+    }
+}
+
+impl<T> Seek for BufReaderWriter<T>
+where
+    T: Write + Seek,
+{
+    fn seek(&mut self, seek_from: SeekFrom) -> std::io::Result<u64> {
+        match seek_from {
+            SeekFrom::Start(pos) => {
+                let in_mem_range = self.position_in_source()
+                    ..self.position_in_source() + self.buffer.num_valid_bytes() as u64;
+                if in_mem_range.contains(&pos) {
+                    // We just need to adjust the position inside the buffer
+                    self.buffer.set_position(pos - self.position_in_source());
+                    Ok(self.position())
+                } else {
+                    if self.buffer.written {
+                        self.dump_buffer()?;
+                    }
+                    self.buffer.clear();
+                    self.pos = self.source.seek(SeekFrom::Start(pos))?;
+                    self.n = 0;
+                    Ok(self.position())
+                }
+            }
+            SeekFrom::End(pos) => {
+                if self.buffer.written {
+                    self.dump_buffer()?;
+                }
+                self.buffer.clear();
+
+                self.pos = self.source.seek(SeekFrom::End(pos))?;
+                self.n = 0;
+                Ok(self.position())
+            }
+            SeekFrom::Current(direction) => {
+                if direction == 0 {
+                    // Shortcut as doing SeekFrom::Current(0) is common to get
+                    // the position
+                    Ok(self.position())
+                } else if direction < 0 {
+                    // Seeking backward by:
+                    let abs_d = (-direction) as usize;
+
+                    if abs_d > self.buffer.position() {
+                        // Trying to seek to a place that is before what the buffer contains
+                        if abs_d as u64 > self.position_in_source() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "Seeking before start",
+                            ));
+                        }
+
+                        if self.buffer.written {
+                            self.dump_buffer()?;
+                        }
+
+                        self.pos = self.source.seek(SeekFrom::Current(
+                            direction - (self.n as i64 - self.buffer.position() as i64),
+                        ))?;
+                        self.buffer.clear();
+                        self.n = 0;
+                        Ok(self.pos)
+                    } else {
+                        // Trying to seek to a place that is within the buffer
+                        self.buffer
+                            .set_position((self.buffer.position() - abs_d) as u64);
+                        Ok(self.position())
+                    }
+                } else {
+                    // Seeking forward
+                    let amount = direction as u64;
+
+                    if amount >= self.buffer.num_readable_bytes_left() as u64 {
+                        // Trying to seek to a place that is past what the buffer contains
+                        if self.buffer.written {
+                            self.dump_buffer()?;
+                        }
+                        self.buffer.clear();
+
+                        // todo check this is correct
+                        self.pos = self.source.seek(SeekFrom::Current(
+                            self.position_in_source() as i64 + direction,
+                        ))?;
+                        self.n = 0;
+                        Ok(self.position())
+                    } else {
+                        // Trying to seek to a place that is within the buffer
+                        self.buffer
+                            .set_position(self.buffer.position() as u64 + amount);
+                        Ok(self.position())
+                    }
+                }
+            }
+        }
+    }
+
+    fn stream_position(&mut self) -> std::io::Result<u64> {
+        Ok(self.position())
+    }
+}
+
+impl<T> Drop for BufReaderWriter<T>
+where
+    T: Write + Seek,
+{
+    fn drop(&mut self) {
+        if self.buffer.written {
+            let _ = self.flush();
+        }
+    }
+}
+
+
+/// After executing a command, all the requested bytes should have been written
+/// unless an error occurred
+enum WriteAllCommand {
+    /// The buffer has enough capacity to store the data
+    ///
+    /// So, write to the buffer
+    Write,
+    /// The buffer does not have enough capacity to store the data
+    ///
+    /// Write to the buffer, then dump the buffer to the source
+    /// and finally, write again to the buffer
+    WriteDumpWrite(usize),
+    /// Dump the buffer, then write directly to the source
+    DumpWriteDirect,
+    /// Write directly to the source
+    WriteDirect,
+}
+
+// enum ReadExactCommand {
+//     /// The buffer has all the data needed,
+//     /// so simply read it from it
+//     Read,
+//     /// The buffer does not have all the data needed,
+//     /// only some part of it.
+//     ///
+//     /// So First read from the buffer, refill it, then finish reading
+//     /// It may be necessary to dump the buffer before doing a refill as
+//     ReadFillRead {
+//         dump_before_fill: bool,
+//     },
+//     ReadDirect {
+//         dump_before: bool,
+//     },
+//     ReadReadDirect {
+//         dump_before_direct_read: bool,
+//     },
+// }
+
+/// After executing a command, not all bytes may have been read
+enum ReadCommand {
+    /// Read `n` bytes from the buffer
+    Read(usize),
+    /// Fill the buffer, then read all the bytes from the original request
+    ///
+    /// The buffer may need to be dumped before being refilled
+    FillRead { dump_before_fill: bool },
+    /// Read directly all the bytes from the original request from the source
+    /// (skip the buffer)
+    ///
+    /// The buffer may need to be dumped before
+    ReadDirect { dump_before: bool },
+}
+
+
+struct Buffer {
+    data: Vec<u8>,
+    pos: usize,
+    written: bool,
+}
+
+impl Buffer {
+    fn new() -> Self {
+        let buffer_cap = 8192;
+        Self {
+            data: Vec::with_capacity(buffer_cap),
+            pos: 0,
+            written: false,
+        }
+    }
+
+    fn has_readable_bytes_left(&self) -> bool {
+        self.pos != self.data.len()
+    }
+
+    fn num_readable_bytes_left(&self) -> usize {
+        self.data.len() - self.pos
+    }
+
+    fn num_writable_bytes_left(&self) -> usize {
+        self.data.capacity() - self.pos
+    }
+
+    fn num_valid_bytes(&self) -> usize {
+        self.data.len()
+    }
+
+    fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    /// Fill the `self` from the `source`.
+    ///
+    /// This discards any data already present in `self`
+    fn fill_from(&mut self, mut source: impl Read) -> std::io::Result<usize> {
+        debug_assert!(!self.has_readable_bytes_left());
+        self.data.resize(self.data.capacity(), 0);
+        let n = source.read(&mut self.data)?;
+
+        self.pos = 0;
+        self.data.resize(n, 0);
+        self.written = false;
+
+        Ok(n)
+    }
+
+    fn set_position(&mut self, pos: u64) {
+        debug_assert!(pos < self.data.len() as u64);
+        self.pos = pos.min(self.data.len() as u64) as usize;
+    }
+
+    fn position(&self) -> usize {
+        self.pos
+    }
+
+    fn dump(&mut self, mut dst: impl Write) -> std::io::Result<usize> {
+        let n = self.data.len();
+        dst.write_all(&self.data)?;
+        Ok(n)
+    }
+
+    fn clear(&mut self) {
+        self.pos = 0;
+        self.data.truncate(0);
+        self.written = false;
+    }
+
+    fn get_read_command(&self, buf: &[u8]) -> ReadCommand {
+        if self.has_readable_bytes_left() {
+            ReadCommand::Read(buf.len().min(self.num_readable_bytes_left()))
+        } else {
+            if buf.len() >= self.capacity() {
+                ReadCommand::ReadDirect {
+                    dump_before: self.written,
+                }
+            } else {
+                ReadCommand::FillRead {
+                    dump_before_fill: self.written,
+                }
+            }
+        }
+    }
+
+    fn get_write_exact_command(&self, buf: &[u8]) -> WriteAllCommand {
+        if buf.len() >= self.capacity() {
+            if self.written && self.num_valid_bytes() != 0 {
+                WriteAllCommand::DumpWriteDirect
+            } else {
+                WriteAllCommand::WriteDirect
+            }
+        } else {
+            if self.num_writable_bytes_left() >= buf.len() {
+                WriteAllCommand::Write
+            } else {
+                WriteAllCommand::WriteDumpWrite(self.num_writable_bytes_left())
+            }
+        }
+    }
+}
+
+impl Read for Buffer {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.num_readable_bytes_left().min(buf.len());
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+
+        debug_assert!(self.pos <= self.data.len());
+        Ok(n)
+    }
+}
+
+impl Write for Buffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.num_writable_bytes_left().min(buf.len());
+        if n == 0 {
+            return Ok(0);
+        }
+
+        debug_assert!(self.pos + n <= self.data.capacity());
+        if self.pos + n > self.data.len() {
+            self.data.resize(self.pos + n, 0u8);
+        }
+        self.data[self.pos..self.pos + n].copy_from_slice(&buf[..n]);
+        self.pos += n;
+        self.written = true;
+
+        debug_assert!(self.pos <= self.data.len());
+
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use crate::BufReaderWriter;
+    use rand::Rng;
+    use std::io::{Cursor, Read, Seek, Write};
+
+    #[test]
+    fn test_seek_end_then_write() {
+        let mut data = Cursor::new(vec![]);
+
+        data.write_all(b"Yoshi").unwrap();
+        data.set_position(0);
+
+        let mut buf = BufReaderWriter::new(data);
+
+        let n = buf.seek(std::io::SeekFrom::End(-3)).unwrap();
+        assert_eq!(n, 2);
+
+        buf.write_all(b"Yoshi").unwrap();
+        assert!(buf.buffer.written);
+        let n = buf.seek(std::io::SeekFrom::Start(0)).unwrap();
+        assert_eq!(n, 0);
+
+        let mut bytes = [0u8; 7];
+        buf.read_exact(bytes.as_mut_slice()).unwrap();
+        assert_eq!(&bytes, b"YoYoshi");
+    }
+
+    #[test]
+    fn test_seek_current_negative_too_far() {
+        let mut data = Cursor::new(vec![]);
+
+        data.write_all(b"Yoshi").unwrap();
+        data.set_position(0);
+
+        let mut buf = BufReaderWriter::new(data);
+
+        assert_eq!(buf.position(), 0);
+        assert!(matches!(buf.stream_position(), Ok(0)));
+
+        let result = buf.seek(std::io::SeekFrom::Current(-6));
+        assert!(matches!(result, Err(_)));
+
+        assert_eq!(buf.position(), 0);
+        assert!(matches!(buf.stream_position(), Ok(0)));
+    }
+
+    #[test]
+    fn test_drop_flushes() {
+        let mut cursor = Cursor::new(vec![]);
+        let mut buf = BufReaderWriter::new(&mut cursor);
+
+        assert_eq!(buf.position(), 0);
+        assert!(matches!(buf.stream_position(), Ok(0)));
+
+        assert_eq!(buf.buffer.written, false);
+        assert_eq!(buf.buffer.num_readable_bytes_left(), 0);
+        assert_eq!(buf.position(), 0);
+
+        let data = b"Eco Dome Aldani";
+        buf.write_all(data).unwrap();
+
+        assert_eq!(buf.buffer.written, true);
+        assert_eq!(buf.buffer.num_readable_bytes_left(), 0);
+        assert_eq!(buf.position(), data.len() as u64);
+
+        // Nothing was actually written yet
+        assert_eq!(buf.inner().position(), 0);
+
+        drop(buf);
+
+        assert_eq!(cursor.position(), data.len() as u64);
+        let s = String::from_utf8(cursor.into_inner()).unwrap();
+        assert_eq!(s.as_bytes(), data);
+    }
+
+    #[test]
+    fn write_more_than_buffer_capacity() {
+        {
+            // First, the simple case, where we never wrote not read anything
+            // thus the buffer is empty
+
+            let mut cursor = Cursor::new(vec![]);
+            let mut buf = BufReaderWriter::new(&mut cursor);
+
+            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.num_valid_bytes(), 0);
+
+            let mut rng = rand::rng();
+            let mut data = vec![0u8; buf.capacity()];
+            for v in data.iter_mut() {
+                *v = rng.random();
+            }
+
+            // Check that nothing was written in the buffer,
+            // instead we wrote directly to the source
+            buf.write_all(&data).unwrap();
+            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.num_valid_bytes(), 0);
+            assert_eq!(buf.inner().get_ref(), &data);
+        }
+
+        {
+            // We wrote something before trying a write
+            // with >= capacity
+
+            let mut cursor = Cursor::new(vec![]);
+            let mut buf = BufReaderWriter::new(&mut cursor);
+
+            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.num_valid_bytes(), 0);
+
+            let mut rng = rand::rng();
+            let mut data = vec![0u8; buf.capacity() + 50];
+            for v in data.iter_mut() {
+                *v = rng.random();
+            }
+
+            let (first_write, second_write) = data.split_at_mut(50);
+
+            buf.write_all(first_write).unwrap();
+
+            assert_eq!(buf.buffer.written, true);
+            assert_eq!(buf.buffer.num_valid_bytes(), 50);
+            assert!(buf.inner().get_ref().is_empty());
+
+            buf.write_all(second_write).unwrap();
+            // The buffer has been dumped
+            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.num_valid_bytes(), 0);
+            assert_eq!(buf.inner().get_ref(), data.as_slice());
+        }
+    }
+
+    #[test]
+    fn read_more_than_buffer_capacity() {
+        {
+            // First, the simple case, where we never wrote not read anything
+            // thus the buffer is empty
+
+            let mut rng = rand::rng();
+            let mut cursor = Cursor::new(vec![]);
+            let mut buf = BufReaderWriter::new(&mut cursor);
+            let buf_capacity = buf.capacity();
+            let n = 4;
+
+            buf.source.get_mut().resize(buf_capacity * 4, 0u8);
+            for v in buf.source.get_mut() {
+                *v = rng.random();
+            }
+
+            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.num_valid_bytes(), 0);
+
+            let mut request = vec![0u8; buf.capacity()];
+            for i in 0..n {
+                buf.read_exact(&mut request).unwrap();
+                assert_eq!(buf.buffer.written, false);
+                assert_eq!(buf.buffer.num_valid_bytes(), 0);
+                assert_eq!(
+                    &buf.inner().get_ref()[i * buf_capacity..(i + 1) * buf_capacity],
+                    &request
+                );
+            }
+        }
+
+        {
+            // We read a small thing before trying a big read
+
+            let mut rng = rand::rng();
+            let mut cursor = Cursor::new(vec![]);
+            let mut buf = BufReaderWriter::new(&mut cursor);
+            let buf_capacity = buf.capacity();
+
+            buf.source.get_mut().resize((buf_capacity * 4) + 77, 0u8);
+            for v in buf.source.get_mut() {
+                *v = rng.random();
+            }
+
+            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.num_valid_bytes(), 0);
+
+            let mut first_request = vec![0u8; 104];
+            buf.read_exact(&mut first_request).unwrap();
+            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.num_valid_bytes(), buf_capacity);
+            assert_eq!(
+                buf.buffer.num_readable_bytes_left(),
+                buf_capacity - first_request.len()
+            );
+            assert_eq!(&buf.inner().get_ref()[..104], &first_request);
+
+            let cloned_data = buf.inner().get_ref().to_vec();
+            let mut request = vec![0u8; buf.inner().get_ref().len() - first_request.len()];
+            for (chunk_to_read, expected) in request
+                .chunks_mut(buf_capacity)
+                .zip(cloned_data[first_request.len()..].chunks(buf_capacity))
+            {
+                buf.read_exact(chunk_to_read).unwrap();
+                assert_eq!(buf.buffer.written, false);
+                assert_eq!(&chunk_to_read, &expected);
+            }
+        }
+
+        {
+            // We write a small thing before trying a big read
+
+            let mut rng = rand::rng();
+            let mut cursor = Cursor::new(vec![]);
+            let mut buf = BufReaderWriter::new(&mut cursor);
+            let buf_capacity = buf.capacity();
+
+            buf.source.get_mut().resize((buf_capacity * 4) + 77, 0u8);
+            for v in buf.source.get_mut() {
+                *v = rng.random();
+            }
+
+            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.num_valid_bytes(), 0);
+
+            let mut cloned_data = buf.inner().get_ref().to_vec();
+            let mut data_to_write = vec![0u8; 77];
+            for v in data_to_write.iter_mut() {
+                *v = rng.random();
+            }
+            buf.write_all(&data_to_write).unwrap();
+            assert_eq!(buf.buffer.written, true);
+            cloned_data[..data_to_write.len()]
+                .copy_from_slice(&data_to_write);
+            assert_eq!(
+                buf.position(),
+                data_to_write.len() as u64
+            );
+
+            let mut request =
+                vec![0u8; cloned_data.len() - data_to_write.len()];
+            for (chunk_to_read, expected) in request
+                .chunks_mut(buf_capacity)
+                .zip(cloned_data[data_to_write.len()..].chunks(buf_capacity))
+            {
+                buf.read_exact(chunk_to_read).unwrap();
+                assert_eq!(buf.buffer.written, false);
+                assert_eq!(&chunk_to_read, &expected);
+            }
+            assert_eq!(buf.source.get_ref(), &cloned_data);
+        }
+
+        {
+            // We read and write a small thing before trying a big read
+
+            let mut rng = rand::rng();
+            let mut cursor = Cursor::new(vec![]);
+            let mut buf = BufReaderWriter::new(&mut cursor);
+            let buf_capacity = buf.capacity();
+
+            buf.source.get_mut().resize((buf_capacity * 4) + 77, 0u8);
+            for v in buf.source.get_mut() {
+                *v = rng.random();
+            }
+
+            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.num_valid_bytes(), 0);
+
+            let mut first_request = vec![0u8; 104];
+            buf.read_exact(&mut first_request).unwrap();
+            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.num_valid_bytes(), buf_capacity);
+            assert_eq!(
+                buf.buffer.num_readable_bytes_left(),
+                buf_capacity - first_request.len()
+            );
+            assert_eq!(
+                &buf.inner().get_ref()[..first_request.len()],
+                &first_request
+            );
+            assert_eq!(buf.position(), first_request.len() as u64);
+
+            let mut cloned_data = buf.inner().get_ref().to_vec();
+            let mut data_to_write = vec![0u8; 77];
+            for v in data_to_write.iter_mut() {
+                *v = rng.random();
+            }
+            buf.write_all(&data_to_write).unwrap();
+            assert_eq!(buf.buffer.written, true);
+            cloned_data[first_request.len()..data_to_write.len() + first_request.len()]
+                .copy_from_slice(&data_to_write);
+            assert_eq!(
+                buf.position(),
+                first_request.len() as u64 + data_to_write.len() as u64
+            );
+
+            let mut request =
+                vec![0u8; cloned_data.len() - first_request.len() - data_to_write.len()];
+            for (chunk_to_read, expected) in request
+                .chunks_mut(buf_capacity)
+                .zip(cloned_data[first_request.len() + data_to_write.len()..].chunks(buf_capacity))
+            {
+                buf.read_exact(chunk_to_read).unwrap();
+                assert_eq!(buf.buffer.written, false);
+                assert_eq!(&chunk_to_read, &expected);
+            }
+            assert_eq!(buf.source.get_ref(), &cloned_data);
+        }
+    }
+}
