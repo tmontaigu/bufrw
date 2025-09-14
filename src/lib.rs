@@ -222,7 +222,8 @@ where
                     ..self.start_position_in_source() + self.buffer.num_valid_bytes() as u64;
                 if in_mem_range.contains(&pos) {
                     // We just need to adjust the position inside the buffer
-                    self.buffer.set_position(pos - self.start_position_in_source());
+                    self.buffer
+                        .set_position(pos - self.start_position_in_source());
                     Ok(self.position())
                 } else {
                     if self.buffer.is_dirty {
@@ -355,38 +356,41 @@ enum ReadCommand {
 }
 
 struct Buffer {
-    data: Vec<u8>,
+    data: Box<[u8]>,
     pos: usize,
+    filled: usize,
     is_dirty: bool,
 }
 
 impl Buffer {
     fn with_capacity(capacity: usize) -> Self {
+        let data = vec![0u8; capacity].into_boxed_slice();
         Self {
-            data: Vec::with_capacity(capacity),
+            data,
             pos: 0,
+            filled: 0,
             is_dirty: false,
         }
     }
 
     fn has_readable_bytes_left(&self) -> bool {
-        self.pos != self.data.len()
+        self.pos != self.filled
     }
 
     fn num_readable_bytes_left(&self) -> usize {
-        self.data.len() - self.pos
+        self.filled - self.pos
     }
 
     fn num_writable_bytes_left(&self) -> usize {
-        self.data.capacity() - self.pos
+        self.capacity() - self.pos
     }
 
     fn num_valid_bytes(&self) -> usize {
-        self.data.len()
+        self.filled
     }
 
     fn capacity(&self) -> usize {
-        self.data.capacity()
+        self.data.len()
     }
 
     /// Fill the `self` from the `source`.
@@ -394,19 +398,17 @@ impl Buffer {
     /// This discards any data already present in `self`
     fn fill_from(&mut self, mut source: impl Read) -> std::io::Result<usize> {
         debug_assert!(!self.has_readable_bytes_left());
-        self.data.resize(self.data.capacity(), 0);
         let n = source.read(&mut self.data)?;
-
+        self.filled = n;
         self.pos = 0;
-        self.data.resize(n, 0);
         self.is_dirty = false;
 
         Ok(n)
     }
 
     fn set_position(&mut self, pos: u64) {
-        debug_assert!(pos < self.data.len() as u64);
-        self.pos = pos.min(self.data.len() as u64) as usize;
+        debug_assert!(pos < self.filled as u64);
+        self.pos = pos.min(self.filled as u64) as usize;
     }
 
     fn position(&self) -> usize {
@@ -414,14 +416,14 @@ impl Buffer {
     }
 
     fn dump(&mut self, mut dst: impl Write) -> std::io::Result<usize> {
-        let n = self.data.len();
-        dst.write_all(&self.data)?;
+        let n = self.filled;
+        dst.write_all(&self.data[..n])?;
         Ok(n)
     }
 
     fn clear(&mut self) {
         self.pos = 0;
-        self.data.truncate(0);
+        self.filled = 0;
         self.is_dirty = false;
     }
 
@@ -472,15 +474,15 @@ impl Write for Buffer {
             return Ok(0);
         }
 
-        debug_assert!(self.pos + n <= self.data.capacity());
-        if self.pos + n > self.data.len() {
-            self.data.resize(self.pos + n, 0u8);
+        debug_assert!(self.pos + n <= self.capacity());
+        if self.pos + n > self.filled {
+            self.filled = self.pos + n;
         }
         self.data[self.pos..self.pos + n].copy_from_slice(&buf[..n]);
         self.pos += n;
         self.is_dirty = true;
 
-        debug_assert!(self.pos <= self.data.len());
+        debug_assert!(self.pos <= self.filled);
 
         Ok(n)
     }
