@@ -171,6 +171,58 @@ where
             }
         }
     }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        match self.buffer.get_read_exact_command(buf) {
+            ReadExactCommand::Read => {
+                let n = self.buffer.read(buf)?;
+            }
+            ReadExactCommand::ReadFillRead { split, dump_before_fill } => {
+                let (first, second) = buf.split_at_mut(split);
+                self.buffer.read(first)?;
+                if dump_before_fill {
+                    self.flush_buffer()?;
+                    self.buffer.clear();
+                    self.n = 0;
+                }
+                let n = self.buffer.fill_from(&mut self.inner)?;
+                self.pos += n as u64;
+                self.n = n;
+                self.buffer.read(second)?;
+            }
+            ReadExactCommand::FillRead { dump_before_fill } => {
+                if dump_before_fill {
+                    self.flush_buffer()?;
+                    self.buffer.clear();
+                    self.n = 0;
+                }
+                let n = self.buffer.fill_from(&mut self.inner)?;
+                self.pos += n as u64;
+                self.buffer.read(buf)?;
+            }
+            ReadExactCommand::ReadDirect { dump_before } => {
+                if dump_before {
+                    self.flush_buffer()?;
+                    self.buffer.clear();
+                    self.n = 0;
+                }
+                let n = self.inner.read(buf)?;
+                self.pos += n as u64;
+            }
+            ReadExactCommand::ReadReadDirect { split, dump_before } => {
+                let (first, second) = buf.split_at_mut(split);
+                self.buffer.read(first)?;
+                if dump_before {
+                    self.flush_buffer()?;
+                    self.buffer.clear();
+                    self.n = 0;
+                }
+                let n= self.inner.read(second)?;
+                self.pos += n as u64;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<T> Write for BufReaderWriter<T>
@@ -355,6 +407,34 @@ enum ReadCommand {
     ReadDirect { dump_before: bool },
 }
 
+/// After executing a command, all bytes will be read
+enum ReadExactCommand {
+    /// The whole output can be filled bu reading from the buffer
+    Read,
+    /// Read from the buffer, re-fill the buffer, then read all the bytes from the original request
+    ///
+    /// The buffer may need to be dumped before being refilled
+    ReadFillRead {
+        split: usize,
+        dump_before_fill: bool,
+    },
+    FillRead {
+        dump_before_fill: bool,
+    },
+    /// Read directly all the bytes from the original request from the source
+    /// (skip the buffer)
+    ///
+    /// The buffer may need to be dumped before
+    ReadDirect {
+        dump_before: bool,
+    },
+    /// Read from buffer, then finish reading from the source
+    ReadReadDirect {
+        split: usize,
+        dump_before: bool,
+    },
+}
+
 struct Buffer {
     data: Box<[u8]>,
     pos: usize,
@@ -451,6 +531,34 @@ impl Buffer {
     }
 
     #[inline]
+    fn get_read_exact_command(&self, buf: &[u8]) -> ReadExactCommand {
+        if buf.len() >= self.capacity() {
+            if self.has_readable_bytes_left() {
+                ReadExactCommand::ReadReadDirect {
+                    split: self.num_readable_bytes_left(),
+                    dump_before: self.is_dirty,
+                }
+            } else {
+                ReadExactCommand::ReadDirect {
+                    dump_before: self.is_dirty,
+                }
+            }
+        } else if self.num_readable_bytes_left() >= buf.len() {
+            ReadExactCommand::Read
+        } else if self.num_readable_bytes_left() < buf.len() {
+            ReadExactCommand::ReadFillRead {
+                split: self.num_readable_bytes_left(),
+                dump_before_fill: self.is_dirty,
+            }
+        } else {
+            debug_assert!(self.num_readable_bytes_left() == 0);
+            ReadExactCommand::FillRead {
+                dump_before_fill: self.is_dirty,
+            }
+        }
+    }
+
+    #[inline]
     fn get_write_exact_command(&self, buf: &[u8]) -> WriteAllCommand {
         if buf.len() >= self.capacity() {
             if self.is_dirty && self.num_valid_bytes() != 0 {
@@ -464,9 +572,8 @@ impl Buffer {
             WriteAllCommand::WriteDumpWrite(self.num_writable_bytes_left())
         }
     }
-}
 
-impl Read for Buffer {
+    #[inline]
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.num_readable_bytes_left().min(buf.len());
         buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
@@ -475,9 +582,8 @@ impl Read for Buffer {
         debug_assert!(self.pos <= self.data.len());
         Ok(n)
     }
-}
 
-impl Write for Buffer {
+    #[inline]
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let n = self.num_writable_bytes_left().min(buf.len());
         if n == 0 {
@@ -495,10 +601,6 @@ impl Write for Buffer {
         debug_assert!(self.pos <= self.filled);
 
         Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
     }
 }
 
