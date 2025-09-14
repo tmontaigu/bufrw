@@ -1,17 +1,13 @@
-use std::{
-    io::{Read, Seek, SeekFrom, Write},
-    usize,
-};
-
+use std::io::{Read, Seek, SeekFrom, Write};
 
 /// Struct that adds buffering to any `T` that supports `Read`, `Write` and `Seek`
 pub struct BufReaderWriter<T: Write + Seek> {
     source: T,
     pos: u64,
+    // todo: rename to something more meaningful
     n: usize,
     buffer: Buffer,
 }
-
 
 impl<T> BufReaderWriter<T>
 where
@@ -59,12 +55,9 @@ where
         debug_assert!(n >= self.n);
 
         self.pos += n as u64;
-        if self.n != 0 {
-            self.n = n;
-        }
+        self.n = n;
         Ok(())
     }
-
 }
 
 impl<T> Read for BufReaderWriter<T>
@@ -147,7 +140,7 @@ where
                     self.buffer.set_position(pos - self.position_in_source());
                     Ok(self.position())
                 } else {
-                    if self.buffer.written {
+                    if self.buffer.is_dirty {
                         self.dump_buffer()?;
                     }
                     self.buffer.clear();
@@ -157,7 +150,7 @@ where
                 }
             }
             SeekFrom::End(pos) => {
-                if self.buffer.written {
+                if self.buffer.is_dirty {
                     self.dump_buffer()?;
                 }
                 self.buffer.clear();
@@ -177,14 +170,11 @@ where
 
                     if abs_d > self.buffer.position() {
                         // Trying to seek to a place that is before what the buffer contains
-                        if abs_d as u64 > self.position_in_source() {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                "Seeking before start",
-                            ));
+                        if abs_d as u64 > self.position() {
+                            return Err(std::io::Error::other("Seeking before start"));
                         }
 
-                        if self.buffer.written {
+                        if self.buffer.is_dirty {
                             self.dump_buffer()?;
                         }
 
@@ -205,17 +195,19 @@ where
                     let amount = direction as u64;
 
                     if amount >= self.buffer.num_readable_bytes_left() as u64 {
+                        let saved_positon = self.position() as i64;
                         // Trying to seek to a place that is past what the buffer contains
-                        if self.buffer.written {
+                        if self.buffer.is_dirty {
                             self.dump_buffer()?;
                         }
                         self.buffer.clear();
-
-                        // todo check this is correct
-                        self.pos = self.source.seek(SeekFrom::Current(
-                            self.position_in_source() as i64 + direction,
-                        ))?;
                         self.n = 0;
+
+                        let new_position = self.position() as i64;
+
+                        self.pos = self
+                            .source
+                            .seek(SeekFrom::Current(saved_positon - new_position + direction))?;
                         Ok(self.position())
                     } else {
                         // Trying to seek to a place that is within the buffer
@@ -238,12 +230,11 @@ where
     T: Write + Seek,
 {
     fn drop(&mut self) {
-        if self.buffer.written {
+        if self.buffer.is_dirty {
             let _ = self.flush();
         }
     }
 }
-
 
 /// After executing a command, all the requested bytes should have been written
 /// unless an error occurred
@@ -298,11 +289,10 @@ enum ReadCommand {
     ReadDirect { dump_before: bool },
 }
 
-
 struct Buffer {
     data: Vec<u8>,
     pos: usize,
-    written: bool,
+    is_dirty: bool,
 }
 
 impl Buffer {
@@ -311,7 +301,7 @@ impl Buffer {
         Self {
             data: Vec::with_capacity(buffer_cap),
             pos: 0,
-            written: false,
+            is_dirty: false,
         }
     }
 
@@ -345,7 +335,7 @@ impl Buffer {
 
         self.pos = 0;
         self.data.resize(n, 0);
-        self.written = false;
+        self.is_dirty = false;
 
         Ok(n)
     }
@@ -368,38 +358,34 @@ impl Buffer {
     fn clear(&mut self) {
         self.pos = 0;
         self.data.truncate(0);
-        self.written = false;
+        self.is_dirty = false;
     }
 
     fn get_read_command(&self, buf: &[u8]) -> ReadCommand {
         if self.has_readable_bytes_left() {
             ReadCommand::Read(buf.len().min(self.num_readable_bytes_left()))
+        } else if buf.len() >= self.capacity() {
+            ReadCommand::ReadDirect {
+                dump_before: self.is_dirty,
+            }
         } else {
-            if buf.len() >= self.capacity() {
-                ReadCommand::ReadDirect {
-                    dump_before: self.written,
-                }
-            } else {
-                ReadCommand::FillRead {
-                    dump_before_fill: self.written,
-                }
+            ReadCommand::FillRead {
+                dump_before_fill: self.is_dirty,
             }
         }
     }
 
     fn get_write_exact_command(&self, buf: &[u8]) -> WriteAllCommand {
         if buf.len() >= self.capacity() {
-            if self.written && self.num_valid_bytes() != 0 {
+            if self.is_dirty && self.num_valid_bytes() != 0 {
                 WriteAllCommand::DumpWriteDirect
             } else {
                 WriteAllCommand::WriteDirect
             }
+        } else if self.num_writable_bytes_left() >= buf.len() {
+            WriteAllCommand::Write
         } else {
-            if self.num_writable_bytes_left() >= buf.len() {
-                WriteAllCommand::Write
-            } else {
-                WriteAllCommand::WriteDumpWrite(self.num_writable_bytes_left())
-            }
+            WriteAllCommand::WriteDumpWrite(self.num_writable_bytes_left())
         }
     }
 }
@@ -428,7 +414,7 @@ impl Write for Buffer {
         }
         self.data[self.pos..self.pos + n].copy_from_slice(&buf[..n]);
         self.pos += n;
-        self.written = true;
+        self.is_dirty = true;
 
         debug_assert!(self.pos <= self.data.len());
 
@@ -440,9 +426,9 @@ impl Write for Buffer {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::bool_assert_comparison)]
     use crate::BufReaderWriter;
     use rand::Rng;
     use std::io::{Cursor, Read, Seek, Write};
@@ -460,7 +446,7 @@ mod tests {
         assert_eq!(n, 2);
 
         buf.write_all(b"Yoshi").unwrap();
-        assert!(buf.buffer.written);
+        assert!(buf.buffer.is_dirty);
         let n = buf.seek(std::io::SeekFrom::Start(0)).unwrap();
         assert_eq!(n, 0);
 
@@ -482,10 +468,140 @@ mod tests {
         assert!(matches!(buf.stream_position(), Ok(0)));
 
         let result = buf.seek(std::io::SeekFrom::Current(-6));
-        assert!(matches!(result, Err(_)));
+        assert!(result.is_err());
 
         assert_eq!(buf.position(), 0);
         assert!(matches!(buf.stream_position(), Ok(0)));
+    }
+
+    #[test]
+    fn test_seek_current_forward() {
+        let mut rng = rand::rng();
+        let mut cursor = Cursor::new(vec![]);
+        let mut buf = BufReaderWriter::new(&mut cursor);
+        let buf_capacity = buf.capacity();
+
+        buf.source.get_mut().resize(buf_capacity * 4, 0u8);
+        for v in buf.source.get_mut() {
+            *v = rng.random();
+        }
+
+        let expected = buf.inner().get_ref().to_vec();
+
+        let mut c = [0u8];
+        buf.read_exact(&mut c).unwrap();
+        assert_eq!(c[0], expected[0]);
+
+        let n = buf.seek(std::io::SeekFrom::Current(1)).unwrap();
+        assert_eq!(n, 2);
+
+        buf.read_exact(&mut c).unwrap();
+        assert_eq!(c[0], expected[2]);
+
+        // Seek past buffer
+        let n = buf
+            .seek(std::io::SeekFrom::Current(buf_capacity as i64))
+            .unwrap();
+        assert_eq!(n, buf_capacity as u64 + 3);
+
+        buf.read_exact(&mut c).unwrap();
+        assert_eq!(c[0], expected[buf_capacity + 3])
+    }
+
+    #[test]
+    fn test_seek_current_at_buffer_boundary() {
+        let mut rng = rand::rng();
+        let mut cursor = Cursor::new(vec![]);
+        let mut buf = BufReaderWriter::new(&mut cursor);
+        let buf_capacity = buf.capacity();
+
+        // Fill the underlying source with some random data
+        buf.source
+            .get_mut()
+            .resize(buf_capacity + buf_capacity / 2, 0u8);
+        for v in buf.source.get_mut() {
+            *v = rng.random();
+        }
+
+        // Clone it to have access to it without borrow problems
+        let mut expected = buf.inner().get_ref().to_vec();
+
+        let mut c = [0u8];
+        buf.read_exact(&mut c).unwrap();
+        assert_eq!(c[0], expected[0]);
+        assert_eq!(buf.buffer.is_dirty, false);
+        assert_eq!(buf.buffer.num_valid_bytes(), buf_capacity);
+        assert_eq!(buf.buffer.num_readable_bytes_left(), buf_capacity - 1);
+        assert_eq!(buf.buffer.num_writable_bytes_left(), buf_capacity - 1);
+        assert_eq!(buf.position(), 1);
+
+        let n = buf
+            .seek(std::io::SeekFrom::Current(buf_capacity as i64 - 2))
+            .unwrap();
+        assert_eq!(n, buf_capacity as u64 - 1);
+        assert_eq!(buf.buffer.is_dirty, false);
+        assert_eq!(buf.buffer.num_valid_bytes(), buf_capacity);
+        assert_eq!(buf.buffer.num_readable_bytes_left(), 1);
+        assert_eq!(buf.buffer.num_writable_bytes_left(), 1);
+
+        // This read_exact should trigger a refill as it crosses the buffer boundary
+        let mut c = [0u8; 2];
+        buf.read_exact(&mut c).unwrap();
+        assert_eq!(&c, &expected[buf_capacity - 1..buf_capacity + 1]);
+        assert_eq!(buf.buffer.is_dirty, false);
+        assert_eq!(buf.buffer.num_valid_bytes(), buf_capacity / 2);
+        assert_eq!(buf.buffer.num_readable_bytes_left(), buf_capacity / 2 - 1);
+        assert_eq!(buf.buffer.num_writable_bytes_left(), buf_capacity - 1);
+
+        // Seek back to before reading the 2 bytes
+        let n = buf.seek(std::io::SeekFrom::Current(-2)).unwrap();
+        assert_eq!(n, buf_capacity as u64 - 1);
+        assert_eq!(buf.buffer.is_dirty, false);
+        assert_eq!(buf.buffer.num_valid_bytes(), 0);
+        assert_eq!(buf.buffer.num_readable_bytes_left(), 0);
+        assert_eq!(buf.buffer.num_writable_bytes_left(), buf_capacity);
+
+        let c2 = [c[0].wrapping_add(1), c[1].wrapping_add(1)];
+
+        buf.write_all(&c2).unwrap();
+        assert_eq!(buf.buffer.is_dirty, true);
+        assert_eq!(buf.buffer.num_valid_bytes(), 2);
+        assert_eq!(buf.buffer.num_readable_bytes_left(), 0);
+        assert_eq!(buf.buffer.num_writable_bytes_left(), buf_capacity - 2);
+        expected[n as usize] = c2[0];
+        expected[n as usize + 1] = c2[1];
+
+        // Seek back to before reading the 2 bytes
+        let n = buf.seek(std::io::SeekFrom::Current(-2)).unwrap();
+        assert_eq!(n, buf_capacity as u64 - 1);
+        assert_eq!(buf.buffer.is_dirty, true);
+        assert_eq!(buf.buffer.num_valid_bytes(), 2);
+        assert_eq!(buf.buffer.num_readable_bytes_left(), 2);
+        assert_eq!(buf.buffer.num_writable_bytes_left(), buf_capacity);
+
+        let n = buf.seek(std::io::SeekFrom::Current(-2)).unwrap();
+        assert_eq!(n, buf_capacity as u64 - 3);
+        assert_eq!(buf.buffer.is_dirty, false); // a dump should have been done
+        assert_eq!(buf.buffer.num_valid_bytes(), 0);
+        assert_eq!(buf.buffer.num_readable_bytes_left(), 0);
+        assert_eq!(buf.buffer.num_writable_bytes_left(), buf_capacity);
+
+        let mut c = vec![0u8; 4];
+        buf.read_exact(&mut c).unwrap();
+        assert_eq!(&c, &expected[buf_capacity - 3..buf_capacity + 1]);
+        assert_eq!(buf.buffer.is_dirty, false);
+        assert_eq!(
+            buf.buffer.num_valid_bytes(),
+            expected.len() - (buf_capacity - 3)
+        );
+        assert_eq!(
+            buf.buffer.num_readable_bytes_left(),
+            buf.buffer.num_valid_bytes() - 4
+        );
+        assert_eq!(buf.buffer.num_writable_bytes_left(), buf_capacity - 4);
+
+        buf.flush().unwrap();
+        assert_eq!(buf.source.get_ref(), expected.as_slice());
     }
 
     #[test]
@@ -496,14 +612,14 @@ mod tests {
         assert_eq!(buf.position(), 0);
         assert!(matches!(buf.stream_position(), Ok(0)));
 
-        assert_eq!(buf.buffer.written, false);
+        assert_eq!(buf.buffer.is_dirty, false);
         assert_eq!(buf.buffer.num_readable_bytes_left(), 0);
         assert_eq!(buf.position(), 0);
 
         let data = b"Eco Dome Aldani";
         buf.write_all(data).unwrap();
 
-        assert_eq!(buf.buffer.written, true);
+        assert_eq!(buf.buffer.is_dirty, true);
         assert_eq!(buf.buffer.num_readable_bytes_left(), 0);
         assert_eq!(buf.position(), data.len() as u64);
 
@@ -526,7 +642,7 @@ mod tests {
             let mut cursor = Cursor::new(vec![]);
             let mut buf = BufReaderWriter::new(&mut cursor);
 
-            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.is_dirty, false);
             assert_eq!(buf.buffer.num_valid_bytes(), 0);
 
             let mut rng = rand::rng();
@@ -538,7 +654,7 @@ mod tests {
             // Check that nothing was written in the buffer,
             // instead we wrote directly to the source
             buf.write_all(&data).unwrap();
-            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.is_dirty, false);
             assert_eq!(buf.buffer.num_valid_bytes(), 0);
             assert_eq!(buf.inner().get_ref(), &data);
         }
@@ -550,7 +666,7 @@ mod tests {
             let mut cursor = Cursor::new(vec![]);
             let mut buf = BufReaderWriter::new(&mut cursor);
 
-            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.is_dirty, false);
             assert_eq!(buf.buffer.num_valid_bytes(), 0);
 
             let mut rng = rand::rng();
@@ -563,13 +679,13 @@ mod tests {
 
             buf.write_all(first_write).unwrap();
 
-            assert_eq!(buf.buffer.written, true);
+            assert_eq!(buf.buffer.is_dirty, true);
             assert_eq!(buf.buffer.num_valid_bytes(), 50);
             assert!(buf.inner().get_ref().is_empty());
 
             buf.write_all(second_write).unwrap();
             // The buffer has been dumped
-            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.is_dirty, false);
             assert_eq!(buf.buffer.num_valid_bytes(), 0);
             assert_eq!(buf.inner().get_ref(), data.as_slice());
         }
@@ -592,13 +708,13 @@ mod tests {
                 *v = rng.random();
             }
 
-            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.is_dirty, false);
             assert_eq!(buf.buffer.num_valid_bytes(), 0);
 
             let mut request = vec![0u8; buf.capacity()];
             for i in 0..n {
                 buf.read_exact(&mut request).unwrap();
-                assert_eq!(buf.buffer.written, false);
+                assert_eq!(buf.buffer.is_dirty, false);
                 assert_eq!(buf.buffer.num_valid_bytes(), 0);
                 assert_eq!(
                     &buf.inner().get_ref()[i * buf_capacity..(i + 1) * buf_capacity],
@@ -620,12 +736,12 @@ mod tests {
                 *v = rng.random();
             }
 
-            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.is_dirty, false);
             assert_eq!(buf.buffer.num_valid_bytes(), 0);
 
             let mut first_request = vec![0u8; 104];
             buf.read_exact(&mut first_request).unwrap();
-            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.is_dirty, false);
             assert_eq!(buf.buffer.num_valid_bytes(), buf_capacity);
             assert_eq!(
                 buf.buffer.num_readable_bytes_left(),
@@ -640,7 +756,7 @@ mod tests {
                 .zip(cloned_data[first_request.len()..].chunks(buf_capacity))
             {
                 buf.read_exact(chunk_to_read).unwrap();
-                assert_eq!(buf.buffer.written, false);
+                assert_eq!(buf.buffer.is_dirty, false);
                 assert_eq!(&chunk_to_read, &expected);
             }
         }
@@ -658,7 +774,7 @@ mod tests {
                 *v = rng.random();
             }
 
-            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.is_dirty, false);
             assert_eq!(buf.buffer.num_valid_bytes(), 0);
 
             let mut cloned_data = buf.inner().get_ref().to_vec();
@@ -667,22 +783,17 @@ mod tests {
                 *v = rng.random();
             }
             buf.write_all(&data_to_write).unwrap();
-            assert_eq!(buf.buffer.written, true);
-            cloned_data[..data_to_write.len()]
-                .copy_from_slice(&data_to_write);
-            assert_eq!(
-                buf.position(),
-                data_to_write.len() as u64
-            );
+            assert_eq!(buf.buffer.is_dirty, true);
+            cloned_data[..data_to_write.len()].copy_from_slice(&data_to_write);
+            assert_eq!(buf.position(), data_to_write.len() as u64);
 
-            let mut request =
-                vec![0u8; cloned_data.len() - data_to_write.len()];
+            let mut request = vec![0u8; cloned_data.len() - data_to_write.len()];
             for (chunk_to_read, expected) in request
                 .chunks_mut(buf_capacity)
                 .zip(cloned_data[data_to_write.len()..].chunks(buf_capacity))
             {
                 buf.read_exact(chunk_to_read).unwrap();
-                assert_eq!(buf.buffer.written, false);
+                assert_eq!(buf.buffer.is_dirty, false);
                 assert_eq!(&chunk_to_read, &expected);
             }
             assert_eq!(buf.source.get_ref(), &cloned_data);
@@ -701,12 +812,12 @@ mod tests {
                 *v = rng.random();
             }
 
-            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.is_dirty, false);
             assert_eq!(buf.buffer.num_valid_bytes(), 0);
 
             let mut first_request = vec![0u8; 104];
             buf.read_exact(&mut first_request).unwrap();
-            assert_eq!(buf.buffer.written, false);
+            assert_eq!(buf.buffer.is_dirty, false);
             assert_eq!(buf.buffer.num_valid_bytes(), buf_capacity);
             assert_eq!(
                 buf.buffer.num_readable_bytes_left(),
@@ -724,7 +835,7 @@ mod tests {
                 *v = rng.random();
             }
             buf.write_all(&data_to_write).unwrap();
-            assert_eq!(buf.buffer.written, true);
+            assert_eq!(buf.buffer.is_dirty, true);
             cloned_data[first_request.len()..data_to_write.len() + first_request.len()]
                 .copy_from_slice(&data_to_write);
             assert_eq!(
@@ -739,7 +850,7 @@ mod tests {
                 .zip(cloned_data[first_request.len() + data_to_write.len()..].chunks(buf_capacity))
             {
                 buf.read_exact(chunk_to_read).unwrap();
-                assert_eq!(buf.buffer.written, false);
+                assert_eq!(buf.buffer.is_dirty, false);
                 assert_eq!(&chunk_to_read, &expected);
             }
             assert_eq!(buf.source.get_ref(), &cloned_data);
