@@ -175,7 +175,7 @@ where
     fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
         match self.buffer.get_read_exact_command(buf) {
             ReadExactCommand::Read => {
-                let n = self.buffer.read(buf)?;
+                self.buffer.read(buf)?;
             }
             ReadExactCommand::ReadFillRead { split, dump_before_fill } => {
                 let (first, second) = buf.split_at_mut(split);
@@ -249,6 +249,12 @@ where
             }
             WriteAllCommand::WriteDirect => self.inner.write(buf),
         }
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        let _n = self.write(buf)?;
+        debug_assert_eq!(_n, buf.len());
+        Ok(())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
