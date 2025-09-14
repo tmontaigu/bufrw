@@ -373,22 +373,27 @@ impl Buffer {
         }
     }
 
+    #[inline]
     fn has_readable_bytes_left(&self) -> bool {
         self.pos != self.filled
     }
 
+    #[inline]
     fn num_readable_bytes_left(&self) -> usize {
         self.filled - self.pos
     }
 
+    #[inline]
     fn num_writable_bytes_left(&self) -> usize {
         self.capacity() - self.pos
     }
 
+    #[inline]
     fn num_valid_bytes(&self) -> usize {
         self.filled
     }
 
+    #[inline]
     fn capacity(&self) -> usize {
         self.data.len()
     }
@@ -406,11 +411,13 @@ impl Buffer {
         Ok(n)
     }
 
+    #[inline]
     fn set_position(&mut self, pos: u64) {
         debug_assert!(pos < self.filled as u64);
         self.pos = pos.min(self.filled as u64) as usize;
     }
 
+    #[inline]
     fn position(&self) -> usize {
         self.pos
     }
@@ -421,12 +428,14 @@ impl Buffer {
         Ok(n)
     }
 
+    #[inline]
     fn clear(&mut self) {
         self.pos = 0;
         self.filled = 0;
         self.is_dirty = false;
     }
 
+    #[inline]
     fn get_read_command(&self, buf: &[u8]) -> ReadCommand {
         if self.has_readable_bytes_left() {
             ReadCommand::Read(buf.len().min(self.num_readable_bytes_left()))
@@ -441,6 +450,7 @@ impl Buffer {
         }
     }
 
+    #[inline]
     fn get_write_exact_command(&self, buf: &[u8]) -> WriteAllCommand {
         if buf.len() >= self.capacity() {
             if self.is_dirty && self.num_valid_bytes() != 0 {
