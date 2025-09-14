@@ -1,8 +1,47 @@
+//! buffered reading and writing over a single stream.
+//!
+//! This crate provides a single adapter that caches reads and writes on the same stream
+//!
+//! `BufReaderWriter` = `std::io::BufReader` + `std::io::BufWriter`
+//!
+//! Example
+//!
+//! ```rust
+//! use bufrw::BufReaderWriter;
+//! use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+//!
+//! # fn main() -> std::io::Result<()> {
+//! let inner = Cursor::new(String::from("Hello _____").into_bytes());
+//! let mut rw = BufReaderWriter::new(inner);
+//!
+//! let mut s = String::new();
+//! rw.read_to_string(&mut s)?;
+//! assert_eq!(s, "Hello _____");
+//!
+//! // Replace the placeholder
+//! rw.seek(SeekFrom::Current(-5))?;
+//! rw.write_all(b"World")?;
+//! rw.seek(SeekFrom::Start(0))?;
+//!
+//! s.clear();
+//! rw.read_to_string(&mut s)?;
+//! assert_eq!(s, "Hello World");
+//!
+//! let inner = rw.into_inner()?;
+//! let underlying_bytes = inner.into_inner();
+//! assert_eq!(underlying_bytes.as_slice(), "Hello World".as_bytes());
+//!
+//! # Ok::<_, std::io::Error>(())
+//! # }
+//! ```
 use std::io::{Read, Seek, SeekFrom, Write};
 
 /// Struct that adds buffering to any `T` that supports `Read`, `Write` and `Seek`
+///
+/// * Seeks do not invalidate the internal buffer if they don't need to
+/// * Large (>= internal buffer's capacity) read/writes will bypass the buffer
 pub struct BufReaderWriter<T: Write + Seek> {
-    source: T,
+    inner: T,
     pos: u64,
     // todo: rename to something more meaningful
     n: usize,
@@ -13,19 +52,28 @@ impl<T> BufReaderWriter<T>
 where
     T: Write + Seek,
 {
-    /// Creates a new BufWriter from the input
-    pub fn new(source: T) -> Self {
+    const DEFAULT_CAPACITY: usize = 8192;
+
+    /// Creates a new BufReaderWriter from the input
+    ///
+    /// The buffer is allocated has the default capacity of `8KiB` (8192 bytes)
+    pub fn new(inner: T) -> Self {
+        Self::with_capacity(inner, Self::DEFAULT_CAPACITY)
+    }
+
+    /// Creates a new BufReaderWriter with the given capacity for the internal buffer
+    pub fn with_capacity(inner: T, capacity: usize) -> Self {
         Self {
-            source,
+            inner,
             pos: 0,
             n: 0,
-            buffer: Buffer::new(),
+            buffer: Buffer::with_capacity(capacity),
         }
     }
 
-    /// Returns the position in the data
+    /// Returns the position in bytes in the data
     pub fn position(&self) -> u64 {
-        self.position_in_source() + self.buffer.position() as u64
+        self.start_position_in_source() + self.buffer.position() as u64
     }
 
     /// Returns the number of bytes the internal buffer can hold at once.
@@ -33,23 +81,56 @@ where
         self.buffer.capacity()
     }
 
+    /// Returns a reference to the inner stream
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    /// Returns a mutable reference to the inner stream
+    ///
+    /// # Note
+    ///
+    /// The buffer may need to be flushed with [Self::flush_buffer] before
+    ///
+    /// Doing modification (read, write, seek) in the returned inner stream
+    /// will cause problems unless carefully done.
+    pub fn inner_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+
+    /// Unwraps the BufReaderWriter, returning the inner stream
+    ///
+    /// This may flush the buffer before which could result in an error
+    pub fn into_inner(mut self) -> std::io::Result<T> {
+        if self.buffer.is_dirty {
+            self.flush_buffer()?;
+        }
+
+        // Since `self` impl Drops we cannot simply deconstruct it
+        let this = std::mem::ManuallyDrop::new(self);
+
+        // SAFETY: double-drops are prevented by putting `this` in a ManuallyDrop that is never dropped
+
+        let inner = unsafe { std::ptr::read(&this.inner) };
+
+        Ok(inner)
+    }
+
     /// Returns the current position in the source
-    // todo: this name is not really accurate
-    fn position_in_source(&self) -> u64 {
+    fn start_position_in_source(&self) -> u64 {
         self.pos - self.n as u64
     }
 
-    pub fn inner(&self) -> &T {
-        &self.source
-    }
-
-    fn dump_buffer(&mut self) -> std::io::Result<()> {
+    /// Dump the buffer at the correct position
+    ///
+    /// Does not clear the buffer
+    pub fn flush_buffer(&mut self) -> std::io::Result<()> {
         if self.n != 0 {
-            let p = self.source.seek(SeekFrom::Current(-(self.n as i64)))?;
+            let p = self.inner.seek(SeekFrom::Current(-(self.n as i64)))?;
             debug_assert_eq!(self.pos - self.n as u64, p);
             self.pos = p;
         }
-        let n = self.buffer.dump(&mut self.source)?;
+        let n = self.buffer.dump(&mut self.inner)?;
 
         // This would mean we wrote fewer bytes than what we originally read
         debug_assert!(n >= self.n);
@@ -69,22 +150,22 @@ where
             ReadCommand::Read(n) => self.buffer.read(&mut buf[..n]),
             ReadCommand::FillRead { dump_before_fill } => {
                 if dump_before_fill {
-                    self.dump_buffer()?;
+                    self.flush_buffer()?;
                     self.buffer.clear();
                     self.n = 0;
                 }
-                let n = self.buffer.fill_from(&mut self.source)?;
+                let n = self.buffer.fill_from(&mut self.inner)?;
                 self.pos += n as u64;
                 self.n = n;
                 self.buffer.read(buf)
             }
             ReadCommand::ReadDirect { dump_before } => {
                 if dump_before {
-                    self.dump_buffer()?;
+                    self.flush_buffer()?;
                     self.buffer.clear();
                     self.n = 0;
                 }
-                let n = self.source.read(buf)?;
+                let n = self.inner.read(buf)?;
                 self.pos += n as u64;
                 Ok(n)
             }
@@ -102,27 +183,27 @@ where
             WriteAllCommand::WriteDumpWrite(n) => {
                 let (first, second) = buf.split_at(n);
                 self.buffer.write(first)?;
-                self.dump_buffer()?;
+                self.flush_buffer()?;
                 self.buffer.clear();
                 self.n = 0;
                 self.buffer.write(second)?;
                 Ok(buf.len())
             }
             WriteAllCommand::DumpWriteDirect => {
-                self.dump_buffer()?;
+                self.flush_buffer()?;
                 self.buffer.clear();
                 self.n = 0;
-                self.source.write(buf)
+                self.inner.write(buf)
             }
-            WriteAllCommand::WriteDirect => self.source.write(buf),
+            WriteAllCommand::WriteDirect => self.inner.write(buf),
         }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.dump_buffer()?;
+        self.flush_buffer()?;
         self.buffer.clear();
         self.n = 0;
-        self.source.flush()
+        self.inner.flush()
     }
 }
 
@@ -130,32 +211,36 @@ impl<T> Seek for BufReaderWriter<T>
 where
     T: Write + Seek,
 {
+    /// Seek to an offset, in bytes,
+    ///
+    /// If the target position falls into the currently stored buffer,
+    /// no seek in the underlying reader will happen.
     fn seek(&mut self, seek_from: SeekFrom) -> std::io::Result<u64> {
         match seek_from {
             SeekFrom::Start(pos) => {
-                let in_mem_range = self.position_in_source()
-                    ..self.position_in_source() + self.buffer.num_valid_bytes() as u64;
+                let in_mem_range = self.start_position_in_source()
+                    ..self.start_position_in_source() + self.buffer.num_valid_bytes() as u64;
                 if in_mem_range.contains(&pos) {
                     // We just need to adjust the position inside the buffer
-                    self.buffer.set_position(pos - self.position_in_source());
+                    self.buffer.set_position(pos - self.start_position_in_source());
                     Ok(self.position())
                 } else {
                     if self.buffer.is_dirty {
-                        self.dump_buffer()?;
+                        self.flush_buffer()?;
                     }
                     self.buffer.clear();
-                    self.pos = self.source.seek(SeekFrom::Start(pos))?;
+                    self.pos = self.inner.seek(SeekFrom::Start(pos))?;
                     self.n = 0;
                     Ok(self.position())
                 }
             }
             SeekFrom::End(pos) => {
                 if self.buffer.is_dirty {
-                    self.dump_buffer()?;
+                    self.flush_buffer()?;
                 }
                 self.buffer.clear();
 
-                self.pos = self.source.seek(SeekFrom::End(pos))?;
+                self.pos = self.inner.seek(SeekFrom::End(pos))?;
                 self.n = 0;
                 Ok(self.position())
             }
@@ -175,10 +260,10 @@ where
                         }
 
                         if self.buffer.is_dirty {
-                            self.dump_buffer()?;
+                            self.flush_buffer()?;
                         }
 
-                        self.pos = self.source.seek(SeekFrom::Current(
+                        self.pos = self.inner.seek(SeekFrom::Current(
                             direction - (self.n as i64 - self.buffer.position() as i64),
                         ))?;
                         self.buffer.clear();
@@ -198,7 +283,7 @@ where
                         let saved_positon = self.position() as i64;
                         // Trying to seek to a place that is past what the buffer contains
                         if self.buffer.is_dirty {
-                            self.dump_buffer()?;
+                            self.flush_buffer()?;
                         }
                         self.buffer.clear();
                         self.n = 0;
@@ -206,7 +291,7 @@ where
                         let new_position = self.position() as i64;
 
                         self.pos = self
-                            .source
+                            .inner
                             .seek(SeekFrom::Current(saved_positon - new_position + direction))?;
                         Ok(self.position())
                     } else {
@@ -254,26 +339,6 @@ enum WriteAllCommand {
     WriteDirect,
 }
 
-// enum ReadExactCommand {
-//     /// The buffer has all the data needed,
-//     /// so simply read it from it
-//     Read,
-//     /// The buffer does not have all the data needed,
-//     /// only some part of it.
-//     ///
-//     /// So First read from the buffer, refill it, then finish reading
-//     /// It may be necessary to dump the buffer before doing a refill as
-//     ReadFillRead {
-//         dump_before_fill: bool,
-//     },
-//     ReadDirect {
-//         dump_before: bool,
-//     },
-//     ReadReadDirect {
-//         dump_before_direct_read: bool,
-//     },
-// }
-
 /// After executing a command, not all bytes may have been read
 enum ReadCommand {
     /// Read `n` bytes from the buffer
@@ -296,10 +361,9 @@ struct Buffer {
 }
 
 impl Buffer {
-    fn new() -> Self {
-        let buffer_cap = 8192;
+    fn with_capacity(capacity: usize) -> Self {
         Self {
-            data: Vec::with_capacity(buffer_cap),
+            data: Vec::with_capacity(capacity),
             pos: 0,
             is_dirty: false,
         }
@@ -481,8 +545,8 @@ mod tests {
         let mut buf = BufReaderWriter::new(&mut cursor);
         let buf_capacity = buf.capacity();
 
-        buf.source.get_mut().resize(buf_capacity * 4, 0u8);
-        for v in buf.source.get_mut() {
+        buf.inner.get_mut().resize(buf_capacity * 4, 0u8);
+        for v in buf.inner.get_mut() {
             *v = rng.random();
         }
 
@@ -516,10 +580,10 @@ mod tests {
         let buf_capacity = buf.capacity();
 
         // Fill the underlying source with some random data
-        buf.source
+        buf.inner
             .get_mut()
             .resize(buf_capacity + buf_capacity / 2, 0u8);
-        for v in buf.source.get_mut() {
+        for v in buf.inner.get_mut() {
             *v = rng.random();
         }
 
@@ -601,7 +665,7 @@ mod tests {
         assert_eq!(buf.buffer.num_writable_bytes_left(), buf_capacity - 4);
 
         buf.flush().unwrap();
-        assert_eq!(buf.source.get_ref(), expected.as_slice());
+        assert_eq!(buf.inner.get_ref(), expected.as_slice());
     }
 
     #[test]
@@ -703,8 +767,8 @@ mod tests {
             let buf_capacity = buf.capacity();
             let n = 4;
 
-            buf.source.get_mut().resize(buf_capacity * 4, 0u8);
-            for v in buf.source.get_mut() {
+            buf.inner.get_mut().resize(buf_capacity * 4, 0u8);
+            for v in buf.inner.get_mut() {
                 *v = rng.random();
             }
 
@@ -731,8 +795,8 @@ mod tests {
             let mut buf = BufReaderWriter::new(&mut cursor);
             let buf_capacity = buf.capacity();
 
-            buf.source.get_mut().resize((buf_capacity * 4) + 77, 0u8);
-            for v in buf.source.get_mut() {
+            buf.inner.get_mut().resize((buf_capacity * 4) + 77, 0u8);
+            for v in buf.inner.get_mut() {
                 *v = rng.random();
             }
 
@@ -769,8 +833,8 @@ mod tests {
             let mut buf = BufReaderWriter::new(&mut cursor);
             let buf_capacity = buf.capacity();
 
-            buf.source.get_mut().resize((buf_capacity * 4) + 77, 0u8);
-            for v in buf.source.get_mut() {
+            buf.inner.get_mut().resize((buf_capacity * 4) + 77, 0u8);
+            for v in buf.inner.get_mut() {
                 *v = rng.random();
             }
 
@@ -796,7 +860,7 @@ mod tests {
                 assert_eq!(buf.buffer.is_dirty, false);
                 assert_eq!(&chunk_to_read, &expected);
             }
-            assert_eq!(buf.source.get_ref(), &cloned_data);
+            assert_eq!(buf.inner.get_ref(), &cloned_data);
         }
 
         {
@@ -807,8 +871,8 @@ mod tests {
             let mut buf = BufReaderWriter::new(&mut cursor);
             let buf_capacity = buf.capacity();
 
-            buf.source.get_mut().resize((buf_capacity * 4) + 77, 0u8);
-            for v in buf.source.get_mut() {
+            buf.inner.get_mut().resize((buf_capacity * 4) + 77, 0u8);
+            for v in buf.inner.get_mut() {
                 *v = rng.random();
             }
 
@@ -853,7 +917,7 @@ mod tests {
                 assert_eq!(buf.buffer.is_dirty, false);
                 assert_eq!(&chunk_to_read, &expected);
             }
-            assert_eq!(buf.source.get_ref(), &cloned_data);
+            assert_eq!(buf.inner.get_ref(), &cloned_data);
         }
     }
 }
