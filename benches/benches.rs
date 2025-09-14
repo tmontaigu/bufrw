@@ -1,6 +1,6 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use rand::RngCore;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::PathBuf;
 
 fn buf_reader_writer_write_only_throughput(c: &mut Criterion) {
@@ -92,7 +92,6 @@ fn buf_reader_writer_read_only_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-
 fn buf_reader_read_only_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("BufReader::read::Throughput");
     let mut bytes = vec![0; 50];
@@ -116,12 +115,119 @@ fn buf_reader_read_only_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+fn create_data_buffer() -> Cursor<Vec<u8>> {
+    let mut rng = rand::rng();
+    let mut bytes = vec![0; 500_000_000];
+    rng.fill_bytes(&mut bytes);
+    Cursor::new(bytes)
+}
+
+fn in_mem_buf_reader_writer_read_only_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("BufReadWriter::read::Throughput");
+    let mut bytes = vec![0; 50];
+
+    let total_num_bytes = 500_000_000;
+    let num_writes = total_num_bytes / bytes.len();
+
+    let mut cursor = create_data_buffer();
+
+    group.throughput(Throughput::Bytes(bytes.len() as u64));
+    group.bench_function("Cursor", |b| {
+        b.iter(|| {
+            cursor.set_position(0);
+            let mut output = bufrw::BufReaderWriter::new(&mut cursor);
+            for _ in 0..num_writes {
+                output.read_exact(&mut bytes).unwrap();
+            }
+        })
+    });
+    group.finish();
+}
+
+
+fn in_mem_buf_reader_read_only_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("BufReader::read::Throughput");
+    let mut bytes = vec![0; 50];
+
+    let total_num_bytes = 500_000_000;
+    let num_writes = total_num_bytes / bytes.len();
+
+    let mut cursor = create_data_buffer();
+
+    group.throughput(Throughput::Bytes(bytes.len() as u64));
+    group.bench_function("Cursor", |b| {
+        b.iter(|| {
+            cursor.set_position(0);
+            let mut output = std::io::BufReader::new(&mut cursor);
+            for _ in 0..num_writes {
+                output.read_exact(&mut bytes).unwrap();
+            }
+        })
+    });
+    group.finish();
+}
+
+
+fn in_mem_buf_reader_writer_write_only_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("BufReadWriter::write::Throughput");
+    let mut rng = rand::rng();
+    let mut bytes = vec![0; 50];
+    rng.fill_bytes(&mut bytes);
+
+    let total_num_bytes = 500_000_000;
+    let num_writes = total_num_bytes / bytes.len();
+
+    let mut cursor = create_data_buffer();
+
+    group.throughput(Throughput::Bytes(bytes.len() as u64));
+    group.bench_function("Cursor", |b| {
+        b.iter(|| {
+            cursor.set_position(0);
+            let mut output = bufrw::BufReaderWriter::new(&mut cursor);
+            for _ in 0..num_writes {
+                output.write_all(&bytes).unwrap();
+            }
+        })
+    });
+    group.finish();
+}
+
+
+fn in_mem_buf_writer_write_only_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("BufWriter::write::Throughput");
+    let mut rng = rand::rng();
+    let mut bytes = vec![0; 50];
+    rng.fill_bytes(&mut bytes);
+
+    let total_num_bytes = 500_000_000;
+    let num_writes = total_num_bytes / bytes.len();
+
+    let mut cursor = create_data_buffer();
+
+    group.throughput(Throughput::Bytes(bytes.len() as u64));
+    group.bench_function("Cursor", |b| {
+        b.iter(|| {
+            cursor.set_position(0);
+            let mut output = std::io::BufWriter::new(&mut cursor);
+            for _ in 0..num_writes {
+                output.write_all(&bytes).unwrap();
+            }
+        })
+    });
+    group.finish();
+}
+
+
 
 criterion_group!(
     benches,
     buf_reader_writer_write_only_throughput,
     buf_writer_write_only_throughput,
     buf_reader_writer_read_only_throughput,
-    buf_reader_read_only_throughput
+    buf_reader_read_only_throughput,
+    in_mem_buf_reader_writer_read_only_throughput,
+    in_mem_buf_reader_read_only_throughput,
+    in_mem_buf_reader_writer_write_only_throughput,
+    in_mem_buf_writer_write_only_throughput,
 );
 criterion_main!(benches);
