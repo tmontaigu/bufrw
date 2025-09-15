@@ -35,6 +35,7 @@
 //! # }
 //! ```
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::ptr;
 
 /// Struct that adds buffering to any `T` that supports `Read`, `Write` and `Seek`
 ///
@@ -71,6 +72,15 @@ where
         }
     }
 
+    pub fn with_buffer(inner: T, buffer: Box<[u8]>) -> Self {
+        Self {
+            inner,
+            pos: 0,
+            n: 0,
+            buffer: Buffer::with_buffer(buffer),
+        }
+    }
+
     /// Returns the position in bytes in the data
     pub fn position(&self) -> u64 {
         self.start_position_in_source() + self.buffer.position() as u64
@@ -101,7 +111,12 @@ where
     /// Unwraps the BufReaderWriter, returning the inner stream
     ///
     /// This may flush the buffer before which could result in an error
-    pub fn into_inner(mut self) -> std::io::Result<T> {
+    pub fn into_inner(self) -> std::io::Result<T> {
+       self.into_parts().map(|(inner, _)| inner)
+    }
+
+
+    pub fn into_parts(mut self) -> std::io::Result<(T, Box<[u8]>)> {
         if self.buffer.is_dirty {
             self.flush_buffer()?;
         }
@@ -112,8 +127,9 @@ where
         // SAFETY: double-drops are prevented by putting `this` in a ManuallyDrop that is never dropped
 
         let inner = unsafe { std::ptr::read(&this.inner) };
+        let buffer = unsafe { std::ptr::read(&this.buffer.data) };
 
-        Ok(inner)
+        Ok((inner, buffer))
     }
 
     /// Returns the current position in the source
@@ -172,6 +188,7 @@ where
         }
     }
 
+    #[cfg_attr(feature = "prof", profi::profile)]
     fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
         match self.buffer.get_read_exact_command(buf) {
             ReadExactCommand::Read => {
@@ -251,17 +268,17 @@ where
         }
     }
 
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        let _n = self.write(buf)?;
-        debug_assert_eq!(_n, buf.len());
-        Ok(())
-    }
-
     fn flush(&mut self) -> std::io::Result<()> {
         self.flush_buffer()?;
         self.buffer.clear();
         self.n = 0;
         self.inner.flush()
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        let _n = self.write(buf)?;
+        debug_assert_eq!(_n, buf.len());
+        Ok(())
     }
 }
 
@@ -451,8 +468,12 @@ struct Buffer {
 impl Buffer {
     fn with_capacity(capacity: usize) -> Self {
         let data = vec![0u8; capacity].into_boxed_slice();
+        Self::with_buffer(data)
+    }
+
+    fn with_buffer(buffer: Box<[u8]>) -> Self {
         Self {
-            data,
+            data: buffer,
             pos: 0,
             filled: 0,
             is_dirty: false,
@@ -487,6 +508,7 @@ impl Buffer {
     /// Fill the `self` from the `source`.
     ///
     /// This discards any data already present in `self`
+    #[cfg_attr(feature = "prof", profi::profile)]
     fn fill_from(&mut self, mut source: impl Read) -> std::io::Result<usize> {
         debug_assert!(!self.has_readable_bytes_left());
         let n = source.read(&mut self.data)?;
@@ -537,6 +559,7 @@ impl Buffer {
     }
 
     #[inline]
+    #[cfg_attr(feature = "prof", profi::profile)]
     fn get_read_exact_command(&self, buf: &[u8]) -> ReadExactCommand {
         if buf.len() >= self.capacity() {
             if self.has_readable_bytes_left() {
@@ -583,8 +606,12 @@ impl Buffer {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.num_readable_bytes_left().min(buf.len());
         buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
-        self.pos += n;
 
+        // unsafe {
+        //     ptr::copy_nonoverlapping(self.data.as_ptr().wrapping_add(self.pos), buf.as_mut_ptr(), n);
+        // }
+
+        self.pos += n;
         debug_assert!(self.pos <= self.data.len());
         Ok(n)
     }
