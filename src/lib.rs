@@ -1,6 +1,6 @@
 //! buffered reading and writing over a single stream.
 //!
-//! This crate provides a single adapter that caches reads and writes on the same stream
+//! This crate provides a single adapter that buffers reads and writes on the same stream
 //!
 //! `BufReaderWriter` = `std::io::BufReader` + `std::io::BufWriter`
 //!
@@ -43,7 +43,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 pub struct BufReaderWriter<T: Write + Seek> {
     inner: T,
     pos: u64,
-    // todo: rename to something more meaningful
+    // The number of bytes we have read from the source into the buffer
     n: usize,
     buffer: Buffer,
 }
@@ -57,17 +57,59 @@ where
     /// Creates a new BufReaderWriter from the input
     ///
     /// The buffer is allocated has the default capacity of `8KiB` (8192 bytes)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use bufrw::BufReaderWriter;
+    /// use std::fs::OpenOptions;
+    ///
+    /// # fn main() -> std::io::Result<()> {
+    /// let file = OpenOptions::new()
+    ///     .read(true)
+    ///     .write(true)
+    ///     .open("some_file.txt")
+    ///     .map(bufrw::BufReaderWriter::new)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(inner: T) -> Self {
         Self::with_capacity(inner, Self::DEFAULT_CAPACITY)
     }
 
     /// Creates a new BufReaderWriter with the given capacity for the internal buffer
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use bufrw::BufReaderWriter;
+    /// use std::fs::OpenOptions;
+    ///
+    /// # fn main() -> std::io::Result<()> {
+    /// let file = OpenOptions::new()
+    ///     .read(true)
+    ///     .write(true)
+    ///     .open("some_file.txt")
+    ///     .map(|f| bufrw::BufReaderWriter::with_capacity(f, 16_384))?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_capacity(inner: T, capacity: usize) -> Self {
         Self {
             inner,
             pos: 0,
             n: 0,
             buffer: Buffer::with_capacity(capacity),
+        }
+    }
+
+    /// Creates a new BufReaderWriter using the given buffer
+    pub fn with_buffer(inner: T, buffer: Box<[u8]>) -> Self {
+        Self {
+            inner,
+            pos: 0,
+            n: 0,
+            buffer: Buffer::with_buffer(buffer),
         }
     }
 
@@ -101,7 +143,12 @@ where
     /// Unwraps the BufReaderWriter, returning the inner stream
     ///
     /// This may flush the buffer before which could result in an error
-    pub fn into_inner(mut self) -> std::io::Result<T> {
+    pub fn into_inner(self) -> std::io::Result<T> {
+       self.into_parts().map(|(inner, _)| inner)
+    }
+
+
+    pub fn into_parts(mut self) -> std::io::Result<(T, Box<[u8]>)> {
         if self.buffer.is_dirty {
             self.flush_buffer()?;
         }
@@ -112,8 +159,9 @@ where
         // SAFETY: double-drops are prevented by putting `this` in a ManuallyDrop that is never dropped
 
         let inner = unsafe { std::ptr::read(&this.inner) };
+        let buffer = unsafe { std::ptr::read(&this.buffer.data) };
 
-        Ok(inner)
+        Ok((inner, buffer))
     }
 
     /// Returns the current position in the source
@@ -251,17 +299,17 @@ where
         }
     }
 
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        let _n = self.write(buf)?;
-        debug_assert_eq!(_n, buf.len());
-        Ok(())
-    }
-
     fn flush(&mut self) -> std::io::Result<()> {
         self.flush_buffer()?;
         self.buffer.clear();
         self.n = 0;
         self.inner.flush()
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        let _n = self.write(buf)?;
+        debug_assert_eq!(_n, buf.len());
+        Ok(())
     }
 }
 
@@ -451,8 +499,12 @@ struct Buffer {
 impl Buffer {
     fn with_capacity(capacity: usize) -> Self {
         let data = vec![0u8; capacity].into_boxed_slice();
+        Self::with_buffer(data)
+    }
+
+    fn with_buffer(buffer: Box<[u8]>) -> Self {
         Self {
-            data,
+            data: buffer,
             pos: 0,
             filled: 0,
             is_dirty: false,
@@ -583,8 +635,15 @@ impl Buffer {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.num_readable_bytes_left().min(buf.len());
         buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
-        self.pos += n;
 
+        // SAFETY: n is always <= buf.len() and <= `self.filled - self.pos`
+        debug_assert!(n <= buf.len());
+        debug_assert!(self.pos + n <= self.filled);
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.data.as_ptr().wrapping_add(self.pos), buf.as_mut_ptr(), n);
+        }
+
+        self.pos += n;
         debug_assert!(self.pos <= self.data.len());
         Ok(n)
     }
